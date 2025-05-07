@@ -25,32 +25,26 @@ text_client = TextAnalyticsClient(
     credential=AzureKeyCredential(API_KEY)
 )
 
-
-def calculate_iou(boxA, boxB):
+def calculate_overlap_ratio(line_box, cluster_box):
     """
-    Calcula Intersection over Union (IoU) entre duas bounding boxes.
-    Cada box é um dict com xmin, ymin, xmax, ymax.
+    Calcula a proporção da bbox da linha que está coberta pela bbox do cluster.
+    Retorna um valor entre 0 e 1.
     """
-    xA = max(boxA['xmin'], boxB['xmin'])
-    yA = max(boxA['ymin'], boxB['ymin'])
-    xB = min(boxA['xmax'], boxB['xmax'])
-    yB = min(boxA['ymax'], boxB['ymax'])
+    xA = max(line_box['xmin'], cluster_box['xmin'])
+    yA = max(line_box['ymin'], cluster_box['ymin'])
+    xB = min(line_box['xmax'], cluster_box['xmax'])
+    yB = min(line_box['ymax'], cluster_box['ymax'])
 
-    # Compute area of intersection
     inter_width = max(0, xB - xA)
     inter_height = max(0, yB - yA)
     inter_area = inter_width * inter_height
 
-    if inter_area == 0:
-        return 0.0  # no overlap
+    line_area = (line_box['xmax'] - line_box['xmin']) * (line_box['ymax'] - line_box['ymin'])
 
-    # Compute areas of each box
-    boxA_area = (boxA['xmax'] - boxA['xmin']) * (boxA['ymax'] - boxA['ymin'])
-    boxB_area = (boxB['xmax'] - boxB['xmin']) * (boxB['ymax'] - boxB['ymin'])
+    if line_area == 0:
+        return 0.0
 
-    # Compute IoU
-    iou = inter_area / float(boxA_area + boxB_area - inter_area)
-    return iou
+    return inter_area / float(line_area)
 
 
 def bbox_from_line(line):
@@ -185,14 +179,15 @@ def analyze_and_cluster(image_path, iou_threshold=0.05):
         'ymax': max(ys)
     }
 
-    # 8️⃣ Rodar expansão por IoU para adicionar linhas próximas
+    overlap_threshold = 0.5
     for i, line in enumerate(lines):
         if i in cluster_idxs:
             continue  # já está no cluster
         line_bbox = bbox_from_line(line)
-        iou = calculate_iou(line_bbox, bbox_global)
-        if iou >= iou_threshold:
-            print(f"➕ Linha '{line['text']}' adicionada ao cluster (IoU={iou:.3f})")
+        overlap_ratio = calculate_overlap_ratio(line_bbox, bbox_global)
+        print(f"🧐 Overlap={overlap_ratio:.3f} | Texto: {line['text']}")
+        if overlap_ratio >= overlap_threshold:
+            print(f"➕ Linha '{line['text']}' adicionada ao cluster (Overlap={overlap_ratio:.3f})")
             cluster_idxs.add(i)
             # Atualiza a bbox global para expandir o cluster
             bbox_global = {
@@ -201,6 +196,7 @@ def analyze_and_cluster(image_path, iou_threshold=0.05):
                 'xmax': max(bbox_global['xmax'], line_bbox['xmax']),
                 'ymax': max(bbox_global['ymax'], line_bbox['ymax'])
             }
+
 
     # 9️⃣ Retorna resultado
     cluster_lines = [lines[idx] for idx in sorted(cluster_idxs)]
