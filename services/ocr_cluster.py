@@ -1,22 +1,21 @@
 import os
 import re
-import cv2
-import numpy as np
 from dotenv import load_dotenv
-from sklearn.cluster import DBSCAN
+import numpy as np
 from azure.ai.vision.imageanalysis import ImageAnalysisClient
 from azure.ai.vision.imageanalysis.models import VisualFeatures
 from azure.ai.textanalytics import TextAnalyticsClient
 from azure.core.credentials import AzureKeyCredential
 
-# Carrega variáveis de ambiente para Azure
+# Carrega variáveis de ambiente (Azure)
 load_dotenv()
 API_KEY = os.getenv("MULTISERVICE_API_KEY")
 ENDPOINT = os.getenv("MULTISERVICE_ENDPOINT")
+
 if not API_KEY or not ENDPOINT:
     raise EnvironmentError("Defina MULTISERVICE_API_KEY e MULTISERVICE_ENDPOINT no .env")
 
-# Inicializa clientes Azure Vision e Text Analytics
+# Inicializa clientes Azure
 vision_client = ImageAnalysisClient(
     endpoint=ENDPOINT,
     credential=AzureKeyCredential(API_KEY)
@@ -26,53 +25,68 @@ text_client = TextAnalyticsClient(
     credential=AzureKeyCredential(API_KEY)
 )
 
-# Blacklist para evitar falsos positivos (empresas confundidas como Person)
-BLACKLIST = {"shein", "magalu", "mercado livre", "amazon"}
 
-
-def analyze_and_cluster(
-    image_path: str,
-    resize_width: int = 1000,
-    eps: float = 0.01,
-    min_samples: int = 1
-) -> dict:
+def calculate_iou(boxA, boxB):
     """
-    Processa a imagem: OCR, NER e clusterização espacial em torno do destinatário e CEP.
-    Retorna:
-      destinatario: str ou None
-      cep: str ou None
-      lines: lista de dicts{text, bbox(normalizado), cx, cy, cluster}
-      cluster_lines: subset de lines no(s) cluster(s) relevante(s)
-      bbox: dict{xmin, ymin, xmax, ymax} normalizado
+    Calcula Intersection over Union (IoU) entre duas bounding boxes.
+    Cada box é um dict com xmin, ymin, xmax, ymax.
     """
-    # 1️⃣ Carrega e redimensiona mantendo proporção
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Imagem não encontrada: {image_path}")
-    h0, w0 = img.shape[:2]
-    ratio = resize_width / float(w0)
-    img_resized = cv2.resize(img, (resize_width, int(h0 * ratio)))
+    xA = max(boxA['xmin'], boxB['xmin'])
+    yA = max(boxA['ymin'], boxB['ymin'])
+    xB = min(boxA['xmax'], boxB['xmax'])
+    yB = min(boxA['ymax'], boxB['ymax'])
 
-    # 2️⃣ Salva temporária para envio ao OCR
-    tmp = image_path + ".tmp.jpg"
-    cv2.imwrite(tmp, img_resized)
-    
-    # 3️⃣ OCR com Azure Vision
-    with open(tmp, 'rb') as f:
+    # Compute area of intersection
+    inter_width = max(0, xB - xA)
+    inter_height = max(0, yB - yA)
+    inter_area = inter_width * inter_height
+
+    if inter_area == 0:
+        return 0.0  # no overlap
+
+    # Compute areas of each box
+    boxA_area = (boxA['xmax'] - boxA['xmin']) * (boxA['ymax'] - boxA['ymin'])
+    boxB_area = (boxB['xmax'] - boxB['xmin']) * (boxB['ymax'] - boxB['ymin'])
+
+    # Compute IoU
+    iou = inter_area / float(boxA_area + boxB_area - inter_area)
+    return iou
+
+
+def bbox_from_line(line):
+    """Converte pontos da bbox para dict (xmin, ymin, xmax, ymax)."""
+    xs = [pt.x for pt in line['bbox']]
+    ys = [pt.y for pt in line['bbox']]
+    return {
+        'xmin': min(xs),
+        'ymin': min(ys),
+        'xmax': max(xs),
+        'ymax': max(ys)
+    }
+
+
+def analyze_and_cluster(image_path, iou_threshold=0.05):
+    """
+    Executa OCR + NER, identifica destinatário (Person não confuso com Organization)
+    e o CEP mais próximo abaixo dele. Usa IoU para adicionar linhas próximas ao cluster.
+    Retorna dados para debug_image desenhar.
+    """
+
+    # 1️⃣ OCR - Analisar imagem com Azure Vision
+    with open(image_path, 'rb') as f:
         ocr_res = vision_client.analyze(
             image_data=f,
             visual_features=[VisualFeatures.READ],
             language='pt'
         )
-    os.remove(tmp)
 
-    # 4️⃣ Extrai linhas OCR: texto, bbox normalizado e centroides
+    # 2️⃣ Extrair todas as linhas OCR em lista ordenada por Y (topo → base)
     lines = []
     if ocr_res.read and ocr_res.read.blocks:
         for block in ocr_res.read.blocks:
             for ln in block.lines:
                 txt = ln.text.strip()
-                bbox = ln.bounding_polygon
+                bbox = ln.bounding_polygon  # lista de 4 pontos normalizados
                 xs = [pt.x for pt in bbox]
                 ys = [pt.y for pt in bbox]
                 lines.append({
@@ -81,68 +95,116 @@ def analyze_and_cluster(
                     'cx': float(np.mean(xs)),
                     'cy': float(np.mean(ys))
                 })
+
     if not lines:
-        return { 'destinatario': None, 'cep': None, 'lines': [], 'cluster_lines': [], 'bbox': None }
+        print("❌ Nenhuma linha OCR detectada.")
+        return {'error': 'Nenhuma linha OCR detectada.'}
 
-    # 5️⃣ NER para identificar destinatário (Person não Organization/blacklist)
-    full_text = '\n'.join([l['text'] for l in lines])
-    ner = text_client.recognize_entities([full_text], language='pt')[0]
+    # ✅ Ordena por posição Y (de cima para baixo)
+    lines.sort(key=lambda l: l['cy'])
+
+    # 3️⃣ Rodar NER para localizar entidades
+    full_text = "\n".join([l['text'] for l in lines])
+    ner_result = text_client.recognize_entities([full_text], language='pt')[0]
+
+    entities = [{'text': ent.text, 'category': ent.category} for ent in ner_result.entities]
+
     dest_idx = None
-    for ent in ner.entities:
+    for ent in ner_result.entities:
         if ent.category == 'Person':
-            ent_low = ent.text.lower()
-            is_org = any(e.text.lower() == ent_low and e.category == 'Organization' for e in ner.entities)
-            if ent_low not in BLACKLIST and not is_org:
-                for i, l in enumerate(lines):
-                    if ent.text in l['text']:
-                        dest_idx = i
-                        break
-                if dest_idx is not None:
+            is_confused = any(
+                other_ent for other_ent in entities
+                if other_ent['text'] == ent.text and other_ent['category'] == 'Organization'
+            )
+            if is_confused:
+                print(f"⚠️ Ignorando '{ent.text}' porque também foi identificado como Organization.")
+                continue
+            for i, l in enumerate(lines):
+                if ent.text in l['text']:
+                    dest_idx = i
                     break
+            if dest_idx is not None:
+                break
 
-    # 6️⃣ Regex para localizar todos os CEPs e escolher o mais próximo
-    ceps = [(i, re.search(r"\b\d{5}-?\d{3}\b", l['text'])) for i, l in enumerate(lines)]
-    ceps = [(i, m.group()) for i, m in ceps if m]
-    cep_idx = None
-    cep_val = None
-    if ceps:
-        if dest_idx is not None:
-            cep_idx, cep_val = min(ceps, key=lambda x: abs(x[0] - dest_idx))
-        else:
-            cep_idx, cep_val = ceps[0]
-
-    # 7️⃣ Clusterização espacial via DBSCAN nos centroides normalizados
-    coords = np.array([[l['cx'], l['cy']] for l in lines])
-    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(coords)
-    for i, l in enumerate(lines):
-        l['cluster'] = int(labels[i])
-
-    # 8️⃣ Determina clusters relevantes (destinatário e CEP)
-    relevant = set()
     if dest_idx is not None:
-        relevant.add(lines[dest_idx]['cluster'])
+        print(f"✅ Destinatário encontrado: '{lines[dest_idx]['text']}' na linha {dest_idx}")
+    else:
+        print("⚠️ Nenhum destinatário (Person válido) detectado.")
+
+    # 4️⃣ Procurar todos CEPs via regex (xxxxx-xxx ou xxxxxxxx)
+    ceps = []
+    cep_pattern = re.compile(r"\b\d{5}-?\d{3}\b")
+    for i, l in enumerate(lines):
+        match = cep_pattern.search(l['text'])
+        if match:
+            ceps.append({
+                'idx': i,
+                'cep': match.group(),
+                'cy': l['cy']
+            })
+
+    if not ceps:
+        print("⚠️ Nenhum CEP encontrado.")
+    else:
+        print(f"🔢 {len(ceps)} CEP(s) encontrado(s): {[c['cep'] for c in ceps]}")
+
+    # 5️⃣ Encontrar o CEP mais próximo e abaixo do destinatário (se existir)
+    cep_idx = None
+    if dest_idx is not None and ceps:
+        ceps_below = [c for c in ceps if c['cy'] > lines[dest_idx]['cy']]
+        if ceps_below:
+            closest_cep = min(ceps_below, key=lambda c: c['cy'] - lines[dest_idx]['cy'])
+            cep_idx = closest_cep['idx']
+            print(f"📍 CEP mais próximo abaixo: '{lines[cep_idx]['text']}' na linha {cep_idx}")
+        else:
+            print("⚠️ Nenhum CEP abaixo do destinatário. Usando o primeiro CEP encontrado.")
+            cep_idx = ceps[0]['idx']
+    elif ceps:
+        cep_idx = ceps[0]['idx']
+        print(f"📍 Nenhum destinatário, usando o primeiro CEP '{lines[cep_idx]['text']}'.")
+
+    # 6️⃣ Inicializa o cluster principal com destinatário + cep
+    cluster_idxs = set()
+    if dest_idx is not None:
+        cluster_idxs.add(dest_idx)
     if cep_idx is not None:
-        relevant.add(lines[cep_idx]['cluster'])
+        cluster_idxs.add(cep_idx)
 
-    # 9️⃣ Filtra linhas dos clusters relevantes (fallback: todas se vazio)
-    cluster_lines = [l for l in lines if l['cluster'] in relevant]
-    if not cluster_lines:
-        cluster_lines = lines
+    if not cluster_idxs:
+        print("⚠️ Nada para clusterizar (nenhuma âncora encontrada).")
+        return {'error': 'Nada encontrado para clusterizar.'}
 
-    # 🔟 Calcula bbox normalizado do cluster relevante
-    xs = [pt.x for l in cluster_lines for pt in l['bbox']]
-    ys = [pt.y for l in cluster_lines for pt in l['bbox']]
-    bbox = {
-        'xmin': float(min(xs)),
-        'ymin': float(min(ys)),
-        'xmax': float(max(xs)),
-        'ymax': float(max(ys))
-    } if xs and ys else None
+    # 7️⃣ Inicializa bbox global com as âncoras
+    initial_lines = [lines[idx] for idx in cluster_idxs]
+    xs = [pt.x for l in initial_lines for pt in l['bbox']]
+    ys = [pt.y for l in initial_lines for pt in l['bbox']]
+    bbox_global = {
+        'xmin': min(xs),
+        'ymin': min(ys),
+        'xmax': max(xs),
+        'ymax': max(ys)
+    }
 
+    # 8️⃣ Rodar expansão por IoU para adicionar linhas próximas
+    for i, line in enumerate(lines):
+        if i in cluster_idxs:
+            continue  # já está no cluster
+        line_bbox = bbox_from_line(line)
+        iou = calculate_iou(line_bbox, bbox_global)
+        if iou >= iou_threshold:
+            print(f"➕ Linha '{line['text']}' adicionada ao cluster (IoU={iou:.3f})")
+            cluster_idxs.add(i)
+            # Atualiza a bbox global para expandir o cluster
+            bbox_global = {
+                'xmin': min(bbox_global['xmin'], line_bbox['xmin']),
+                'ymin': min(bbox_global['ymin'], line_bbox['ymin']),
+                'xmax': max(bbox_global['xmax'], line_bbox['xmax']),
+                'ymax': max(bbox_global['ymax'], line_bbox['ymax'])
+            }
+
+    # 9️⃣ Retorna resultado
+    cluster_lines = [lines[idx] for idx in sorted(cluster_idxs)]
     return {
-        'destinatario': lines[dest_idx]['text'] if dest_idx is not None else None,
-        'cep': cep_val,
-        'lines': lines,
         'cluster_lines': cluster_lines,
-        'bbox': bbox
+        'bbox': bbox_global
     }
