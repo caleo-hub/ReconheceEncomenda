@@ -7,5 +7,7 @@ azure-ai-vision-imageanalysis
 azure-ai-textanalytics
 python-dotenv
 numpy
-scikit-learn
 opencv-python
+PyYAML
+pyzbar
+-e .

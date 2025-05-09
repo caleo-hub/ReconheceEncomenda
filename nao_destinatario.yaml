@@ -1,0 +1,20 @@
+blacklist:
+  ecommerce:
+    - Mercado Livre
+    - Shopee
+    - Amazon Brasil
+    - Magazine Luiza
+    - Americanas
+    - AliExpress
+    - iFood
+    - Casas Bahia
+    - Netshoes
+    - Shein
+  transportadoras:
+    - Correios
+    - J&T Express
+    - Buslog
+    - Azul Cargo Express
+    - Latam Cargo
+    - Loggi
+    - Jadlog
